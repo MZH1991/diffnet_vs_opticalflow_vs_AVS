@@ -1,0 +1,426 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import tensorflow as tf
+import os
+import random
+import time
+import platform
+import psutil
+import csv
+
+def print_hardware_info():
+    print("System Information:")
+    print(f"Operating System: {platform.system()} {platform.release()}")
+    print(f"Processor: {platform.processor()}")
+    print(f"CPU Cores: {psutil.cpu_count(logical=False)}")
+    print(f"Logical Processors: {psutil.cpu_count(logical=True)}")
+    memory = psutil.virtual_memory()
+    print(f"Total Memory: {round(memory.total / (1024 ** 3), 2)} GB")
+
+print_hardware_info()
+
+vector_to_angle_map = {
+    (1, 0): 90,     
+    (1, 1): 45,    
+    (0, 1): 0,    
+    (-1, 1): 315,  
+    (-1, 0): 270,  
+    (-1, -1): 225, 
+    (0, -1): 180,  
+    (1, -1): 135   
+}
+
+pix = 20
+
+def compute_flow_direction(flow):
+    mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+    ang_deg = np.degrees(ang)
+    return ang_deg, mag
+
+def classify_angle_to_nearest(ang_deg):
+    fine_directions = np.array([-360, -315, -270, -225, -180, -135, -90, -45, 0, 45, 90, 135, 180, 225, 270, 315, 360])
+    main_directions = np.array([0, 45, 90, 135, 180, 225, 270, 315])
+    diff = np.abs(fine_directions - ang_deg)
+    nearest_idx = np.argmin(diff)
+    nearest_angle = fine_directions[nearest_idx]
+    if nearest_angle < 0:
+        nearest_angle += 360
+    elif nearest_angle == 360:
+        nearest_angle = 0
+    diff_main = np.abs(main_directions - nearest_angle)
+    main_idx = np.argmin(diff_main)
+    return main_directions[main_idx]
+
+def vector_to_angle(vector):
+    vector_tuple = tuple(vector)
+    return vector_to_angle_map.get(vector_tuple)
+
+def optical_flow_farneback(img_before, img_after):
+    img_before = np.uint8(img_before * 255)
+    img_after = np.uint8(img_after * 255)
+    flow = cv2.calcOpticalFlowFarneback(img_before, img_after, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+    return flow
+
+def optical_flow_lk(img_before, img_after):
+    img_before = np.uint8(img_before * 255)
+    img_after = np.uint8(img_after * 255)
+    lk_params = dict(winSize=(15, 15), maxLevel=2,
+                     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+    p0 = cv2.goodFeaturesToTrack(img_before, mask=None, maxCorners=100, qualityLevel=0.3, minDistance=7, blockSize=7)
+    if p0 is None:
+        return None
+    p1, st, err = cv2.calcOpticalFlowPyrLK(img_before, img_after, p0, None, **lk_params)
+    return p1 - p0 if p1 is not None else None
+
+def optical_flow_dis(img_before, img_after):
+    dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_FAST)
+    img_before = np.uint8(img_before * 255)
+    img_after = np.uint8(img_after * 255)
+    flow = dis.calc(img_before, img_after, None)
+    return flow
+
+def optical_flow_horn_schunck(img_before, img_after, alpha=0.001, iterations=100):
+    img_before = np.float32(img_before) / 255.0
+    img_after = np.float32(img_after) / 255.0
+    u = np.zeros(img_before.shape)
+    v = np.zeros(img_before.shape)
+    kernel_x = np.array([[-1, 1], [-1, 1]]) * 0.25
+    kernel_y = np.array([[-1, -1], [1, 1]]) * 0.25
+    kernel_t = np.array([[1, 1], [1, 1]]) * 0.25
+    fx = cv2.filter2D(img_before, -1, kernel_x) + cv2.filter2D(img_after, -1, kernel_x)
+    fy = cv2.filter2D(img_before, -1, kernel_y) + cv2.filter2D(img_after, -1, kernel_y)
+    ft = cv2.filter2D(img_after, -1, kernel_t) + cv2.filter2D(img_before, -1, -kernel_t)
+    for _ in range(iterations):
+        u_avg = cv2.blur(u, (5, 5))
+        v_avg = cv2.blur(v, (5, 5))
+        numerator = (fx * u_avg + fy * v_avg + ft)
+        denominator = (alpha ** 2 + fx ** 2 + fy ** 2)
+        u = u_avg - fx * numerator / denominator
+        v = v_avg - fy * numerator / denominator
+    flow = np.dstack((u, v))
+    return flow
+
+def optical_flow_pyr_lk(img_before, img_after):
+    img_before = np.uint8(img_before * 255)
+    img_after = np.uint8(img_after * 255)
+    lk_params = dict(winSize=(21, 21), maxLevel=3, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+    p0 = cv2.goodFeaturesToTrack(img_before, mask=None, maxCorners=200, qualityLevel=0.01, minDistance=5, blockSize=7)
+    if p0 is None:
+        return None
+    p1, st, err = cv2.calcOpticalFlowPyrLK(img_before, img_after, p0, None, **lk_params)
+    return p1 - p0 if p1 is not None else None
+
+def optical_flow_deepflow(img_before, img_after):
+    try:
+        from cv2.optflow import createOptFlow_DeepFlow
+        deepflow = createOptFlow_DeepFlow()
+    except AttributeError:
+        raise ImportError("DeepFlow requires 'opencv-contrib-python'. Please install it using 'pip install opencv-contrib-python'.")
+    img_before = np.uint8(img_before * 255)
+    img_after = np.uint8(img_after * 255)
+    flow = deepflow.calc(img_before, img_after, None)
+    return flow
+
+def accuracy(noipixel_range, flow_method):
+    accuracies = []
+    total_start_time = time.time()
+    for noipixel in tqdm(noipixel_range, desc=f"{flow_method.__name__} Progress"):
+        total_images = 2500
+        correct_matches = 0
+        for numk in range(1, total_images + 1):
+            file1 = f'G:/Data Base/pixels/random{pix}{noipixel}/before/{numk}.txt'
+            file2 = f'G:/Data Base/pixels/random{pix}{noipixel}/after/{numk}.txt'
+            file3 = f'G:/Data Base/pixels/random{pix}{noipixel}/label/{numk}.txt'
+            try:
+                img_before = np.loadtxt(file1)
+                img_after = np.loadtxt(file2)
+                label_vector = np.loadtxt(file3)
+            except OSError:
+                continue
+            flow = flow_method(img_before, img_after)
+            if flow is None:
+                continue
+            angles, magnitudes = compute_flow_direction(flow)
+            avg_angle = np.arctan2(np.sum(magnitudes * np.sin(np.radians(angles))),
+                                   np.sum(magnitudes * np.cos(np.radians(angles))))
+            avg_angle_deg = np.degrees(avg_angle)
+            avg_angle_deg = -avg_angle_deg
+            if avg_angle_deg < 0:
+                avg_angle_deg += 360
+            classified_angle = classify_angle_to_nearest(avg_angle_deg)
+            label_angle = vector_to_angle(label_vector)
+            if classified_angle == label_angle:
+                correct_matches += 1
+        accuracy_percent = (correct_matches / total_images) * 100
+        accuracies.append(accuracy_percent)
+    total_end_time = time.time()
+    total_elapsed_time = total_end_time - total_start_time
+    print(f"Method {flow_method.__name__}: Total Time {total_elapsed_time:.2f}s")
+    return accuracies, total_elapsed_time
+
+def method_2_accuracy(noipixel_range):
+    Allomatrix = np.array([[0, 1], [1, 1], [1, 0], [1, -1], [0, -1], [-1, -1], [-1, 0], [-1, 1]])
+    accuracies_method_2 = []
+    total_start_time = time.time()
+    for noipixel in tqdm(noipixel_range, desc="AVS Method Progress"):
+        correct = 0
+        total = 0
+        total_images = 2500
+        for numk in range(1, total_images + 1):
+            file1 = f'G:/Data Base/pixels/random{pix}{noipixel}/before/{numk}.txt'
+            file2 = f'G:/Data Base/pixels/random{pix}{noipixel}/after/{numk}.txt'
+            file3 = f'G:/Data Base/pixels/random{pix}{noipixel}/label/{numk}.txt'
+            a = np.loadtxt(file1, dtype=int)
+            b = np.loadtxt(file2, dtype=int)
+            c = np.loadtxt(file3, dtype=int)
+            Direction = np.zeros(8)
+            for num1 in range(8):
+                for num2 in range(2, 30):
+                    for num3 in range(2, 30):
+                        c2 = b[num2, num3]
+                        c1 = a[num2 + Allomatrix[num1][0], num3 - Allomatrix[num1][1]]
+                        if (c1 > 0) and (c2 > 0):
+                            Direction[num1] += c1
+            Direction1 = Allomatrix[np.argmax(Direction), :]
+            total += 1
+            if (Direction1 == c).all():
+                correct += 1
+        accuracy = (correct / total) * 100
+        accuracies_method_2.append(accuracy)
+    total_end_time = time.time()
+    total_elapsed_time = total_end_time - total_start_time
+    print(f"Method AVS: Total Time {total_elapsed_time:.2f}s")
+    return accuracies_method_2, total_elapsed_time
+
+filters = {
+    'horizontal': np.array([[1, 0, -1], [2, 0, -2], [1, 0, -1]]),
+    'vertical': np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]]),
+    'diag1': np.array([[2, 1, 0], [1, 0, -1], [0, -1, -2]]),
+    'diag2': np.array([[0, 1, 2], [-1, 0, 1], [-2, -1, 0]]),
+    'diag3': np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]]),
+    'diag4': np.array([[1, 2, 0], [2, 0, -1], [0, -1, -2]]),
+    'right_vertical': np.array([[1, 1, 1], [0, 0, 0], [-1, -1, -1]]),
+    'left_vertical': np.array([[1, 0, -1], [1, 0, -1], [1, 0, -1]])
+}
+
+allomatrix = np.array([[0,1], [1,1], [1,0], [1,-1], [0,-1], [-1,-1], [-1,0], [-1,1]])
+
+def direction_to_onehot(direction, allomatrix):
+    idx = np.where((allomatrix == direction).all(axis=1))[0][0]
+    one_hot = np.zeros((allomatrix.shape[0],))
+    one_hot[idx] = 1
+    return one_hot
+
+def load_data_from_txt(folder, start_idx, end_idx, allomatrix):
+    images = []
+    labels = []
+    for i in range(start_idx, end_idx + 1):
+        img_before = np.loadtxt(os.path.join(folder, f'before/{i}.txt'), dtype=int)
+        img_after = np.loadtxt(os.path.join(folder, f'after/{i}.txt'), dtype=int)
+        label_vector = np.loadtxt(os.path.join(folder, f'label/{i}.txt'), dtype=int)
+        label_onehot = direction_to_onehot(label_vector, allomatrix)
+        img_diff = img_after - img_before
+        images.append(img_diff)
+        labels.append(label_onehot)
+    return np.array(images), np.array(labels)
+
+def apply_filters(img, filters):
+    img = img.astype(np.float32)
+    responses = []
+    for name, f in filters.items():
+        response = cv2.filter2D(img, -1, f)
+        responses.append(response)
+    return np.stack(responses, axis=-1)
+
+def build_diffnet_model(input_shape):
+    model = tf.keras.Sequential([
+        tf.keras.layers.Conv2D(32, (3, 3), activation='relu', input_shape=input_shape),
+        tf.keras.layers.MaxPooling2D((2, 2)),
+        tf.keras.layers.Conv2D(64, (3, 3), activation='relu'),
+        tf.keras.layers.MaxPooling2D((2, 2)),
+        tf.keras.layers.Conv2D(64, (3, 3), activation='relu'),
+        tf.keras.layers.Flatten(),
+        tf.keras.layers.Dense(64, activation='relu'),
+        tf.keras.layers.Dense(8, activation='softmax')
+    ])
+    return model
+
+def train_diffnet_model(train_images, train_labels, test_images, test_labels, input_shape, epochs=5):
+    model = build_diffnet_model(input_shape)
+    model.compile(optimizer=tf.keras.optimizers.Adam(),
+                  loss=tf.keras.losses.CategoricalCrossentropy(),
+                  metrics=['accuracy'])
+    model.fit(train_images, train_labels, epochs=epochs, validation_data=(test_images, test_labels), verbose=0)
+    return model
+
+def select_samples_from_folders(all_folders, total_samples_needed):
+    num_folders = len(all_folders)
+    samples_per_folder = total_samples_needed // num_folders
+    extra_samples = total_samples_needed % num_folders
+    selected_files = []
+    for folder in all_folders:
+        folder_path = f'G:/Data Base/pixels/{folder}/'
+        available_files = list(range(1, 10001))
+        selected = random.sample(available_files, samples_per_folder)
+        if extra_samples > 0:
+            selected.append(random.choice(list(set(available_files) - set(selected))))
+            extra_samples -= 1
+        selected_files.append((folder_path, selected))
+    return selected_files
+
+def accuracy_diffnet(noipixel_range):
+    accuracies = []
+    total_start_time = time.time()
+    for noipixel in tqdm(noipixel_range, desc="DiffNet Progress"):
+        start_time = time.time()
+        all_train_folders = [f"random20{str(i)}" for i in range(0, 81) if i != noipixel]
+        test_folder = f'random20{noipixel}'
+        selected_train_files = select_samples_from_folders(all_train_folders, total_samples_needed=750)
+        test_folder_path = f'G:/Data Base/pixels/{test_folder}/'
+        test_images, test_labels = load_data_from_txt(test_folder_path, start_idx=1, end_idx=1000, allomatrix=allomatrix)
+        train_images, train_labels = [], []
+        for folder_path, selected_files in selected_train_files:
+            for file_idx in selected_files:
+                img_before = np.loadtxt(os.path.join(folder_path, f'before/{file_idx}.txt'), dtype=int)
+                img_after = np.loadtxt(os.path.join(folder_path, f'after/{file_idx}.txt'), dtype=int)
+                label_vector = np.loadtxt(os.path.join(folder_path, f'label/{file_idx}.txt'), dtype=int)
+                img_diff = img_after - img_before
+                label_onehot = direction_to_onehot(label_vector, allomatrix)
+                train_images.append(img_diff)
+                train_labels.append(label_onehot)
+        train_images = np.array(train_images)
+        train_labels = np.array(train_labels)
+        train_images_filtered = np.array([apply_filters(img, filters) for img in train_images])
+        test_images_filtered = np.array([apply_filters(img, filters) for img in test_images])
+        input_shape = (train_images_filtered.shape[1], train_images_filtered.shape[2], len(filters))
+        model = train_diffnet_model(train_images_filtered, train_labels, test_images_filtered, test_labels, input_shape, epochs=50)
+        test_loss, test_acc = model.evaluate(test_images_filtered, test_labels, verbose=0)
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        accuracies.append(test_acc * 100)
+    total_end_time = time.time()
+    total_elapsed_time = total_end_time - total_start_time
+    print(f"Method DiffNet: Total Time {total_elapsed_time:.2f}s")
+    return accuracies, total_elapsed_time
+
+noipixel_range = range(0, 81, 5)
+
+methods = [
+    optical_flow_farneback,
+    optical_flow_lk,
+    optical_flow_dis,
+    optical_flow_horn_schunck,
+    optical_flow_pyr_lk,
+    optical_flow_deepflow
+]
+
+all_accuracies = {}
+all_times = {}
+for method in methods:
+    accuracies, total_time = accuracy(noipixel_range, method)
+    all_accuracies[method.__name__] = accuracies
+    all_times[method.__name__] = total_time
+
+accuracies_avs, total_time_avs = method_2_accuracy(noipixel_range)
+all_accuracies['AVS'] = accuracies_avs
+all_times['AVS'] = total_time_avs
+
+accuracies_diffnet, total_time_diffnet = accuracy_diffnet(noipixel_range)
+
+all_accuracies['DiffNet'] = accuracies_diffnet
+all_times['DiffNet'] = total_time_diffnet
+
+with open('line_plot_data.csv', 'w', newline='') as csvfile:
+    fieldnames = ['Noipixel'] + list(all_accuracies.keys())
+    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+    writer.writeheader()
+    for idx, noipixel in enumerate(noipixel_range):
+        row = {'Noipixel': noipixel}
+        for method_name in all_accuracies:
+            row[method_name] = all_accuracies[method_name][idx]
+        writer.writerow(row)
+print("Line plot data saved to 'line_plot_data.csv'.")
+
+plt.figure(figsize=(14, 7), dpi=300)
+
+highlight_colors = {'AVS': '#ff7f00', 'DiffNet': '#4daf4a'}
+normal_color = '#999999'
+
+noipixel_range_avs = np.array(noipixel_range) - 0.2
+noipixel_range_diffnet = np.array(noipixel_range) + 0.2
+
+flow_methods_styles = {
+    'optical_flow_farneback': {'linestyle': '-', 'marker': 'o'},
+    'optical_flow_lk': {'linestyle': '--', 'marker': 'v'},
+    'optical_flow_dis': {'linestyle': '-.', 'marker': 's'},
+    'optical_flow_horn_schunck': {'linestyle': ':', 'marker': 'd'},
+    'optical_flow_pyr_lk': {'linestyle': '-', 'marker': 'x'},
+    'optical_flow_deepflow': {'linestyle': '--', 'marker': 'p'}
+}
+
+for method_name, accuracies in all_accuracies.items():
+    if method_name not in highlight_colors:
+        style = flow_methods_styles.get(method_name, {})
+        plt.plot(noipixel_range, accuracies, label=f'{method_name}',
+                 color=normal_color, linewidth=1.5, marker=style.get('marker', 'o'),
+                 linestyle=style.get('linestyle', '-'), alpha=0.8)
+
+plt.plot(noipixel_range_avs, all_accuracies['AVS'], label='AVS',
+         color=highlight_colors['AVS'], marker='x', linestyle='--', linewidth=3, markersize=8)
+
+plt.plot(noipixel_range_diffnet, all_accuracies['DiffNet'], label='DiffNet',
+         color=highlight_colors['DiffNet'], marker='s', linestyle='-.', linewidth=3, markersize=8)
+
+plt.title('Accuracy Comparison of Different Methods', fontsize=14, weight='bold')
+plt.xlabel('Noisepixel', fontsize=12, labelpad=10)
+plt.ylabel('Accuracy (%)', fontsize=12, labelpad=10)
+
+plt.xticks(fontsize=10)
+plt.yticks(fontsize=10)
+
+plt.grid(False)
+
+plt.legend(fontsize=10, loc='best')
+
+plt.tight_layout(pad=2.0)
+
+plt.savefig('accuracy_comparison.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+plt.figure(figsize=(14, 7), dpi=300)
+
+bar_colors = ['#999999'] * len(all_times)
+highlight_colors_bar = {'AVS': '#ff7f00', 'DiffNet': '#4daf4a'}
+
+methods_names = list(all_times.keys())
+methods_total_times = list(all_times.values())
+for i, method_name in enumerate(methods_names):
+    if method_name in highlight_colors_bar:
+        bar_colors[i] = highlight_colors_bar[method_name]
+
+bars = plt.bar(methods_names, methods_total_times, color=bar_colors, width=0.6, edgecolor='black')
+
+plt.title('Total Computation Time of Different Methods', fontsize=14, weight='bold')
+plt.xlabel('Methods', fontsize=12, labelpad=10)
+plt.ylabel('Total Time (s)', fontsize=12, labelpad=10)
+
+plt.xticks(rotation=45, ha='right', fontsize=10)
+plt.yticks(fontsize=10)
+
+for bar in bars:
+    height = bar.get_height()
+    plt.text(bar.get_x() + bar.get_width() / 2.0, height, f'{height:.2f}s', ha='center', va='bottom', fontsize=9)
+
+plt.grid(False)
+
+from matplotlib.patches import Patch
+legend_elements = [Patch(facecolor='#ff7f00', edgecolor='black', label='AVS'),
+                   Patch(facecolor='#4daf4a', edgecolor='black', label='DiffNet')]
+plt.legend(handles=legend_elements, fontsize=10, loc='upper right')
+
+plt.tight_layout(pad=2.0)
+
+plt.savefig('computation_time_comparison.png', dpi=300, bbox_inches='tight')
+plt.show()
