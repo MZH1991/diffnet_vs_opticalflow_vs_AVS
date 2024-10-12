@@ -1,4 +1,5 @@
 ![Figure_1](https://github.com/user-attachments/assets/a952cd3d-4207-458b-8eff-461f22786f17)
+![Figure_1](https://github.com/user-attachments/assets/5e71305b-91a0-48b6-bf37-fbfba86a8343)
 
 The "random dot" image typically refers to a visual stimulus or image where dots are randomly distributed across a grid. These types of images are often used in vision experiments, motion detection studies, and neural computation research.
 
